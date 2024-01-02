@@ -1,7 +1,7 @@
 // TODO:
 // X Replace Mutex<String> with T
 // X Support Fetchers and Stores
-// 3. Add examples and unit tests
+// X Add examples and unit tests
 // 4. Docs
 // 5. Support other common functionality.
 // 6. Clean up join handle stuff.
@@ -42,8 +42,8 @@ pub enum FetchError {
 
 impl<K, V> Cache<K, V>
 where
-    K: std::fmt::Debug + Copy + std::hash::Hash + Eq + Send + Sync + 'static,
-    V: std::fmt::Debug + Clone + Send + Sync + 'static,
+    K: std::hash::Hash + Copy + Eq + Send + Sync + 'static,
+    V: Send + Sync + 'static,
 {
     pub async fn new(store: impl Store<K, V> + Send + Sync + 'static) -> Self {
         let store = Arc::new(store);

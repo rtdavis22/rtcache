@@ -1,23 +1,22 @@
 use std::error::Error;
 
 use async_trait::async_trait;
+use tokio::sync::Mutex;
 use tokio::time::{sleep, Duration};
 
 use thru::Store;
 
 struct TestStore;
 
-// TODO: Use Mutex<String> or RwLock<String> for the values.
 #[async_trait]
-impl Store<i32, String> for TestStore {
-    async fn fetch(&self, key: &i32) -> String {
+impl Store<i32, Mutex<String>> for TestStore {
+    async fn fetch(&self, key: &i32) -> Mutex<String> {
         println!("[Fetch] key: {}", key);
-        String::from("Hello")
+        Mutex::new(String::from("Hello"))
     }
 
-    async fn update(&self, key: i32, value: String) {
-        println!("[Update] key: {}, value: {}", key, value);
-        // if list is dirty, update store
+    async fn update(&self, key: i32, value: Mutex<String>) {
+        println!("[Update] key: {}, value: {}", key, value.lock().await);
     }
 }
 
@@ -25,13 +24,11 @@ impl Store<i32, String> for TestStore {
 async fn main() -> Result<(), Box<dyn Error>> {
     let mut cache = thru::Cache::new(TestStore).await;
 
-    let v = cache.get(12).await;
-    drop(v);
-
-    let v = cache.get(12).await;
+    let v = cache.get(12).await.unwrap();
 
     tokio::spawn(async move {
-        sleep(Duration::from_secs(3)).await;
+        sleep(Duration::from_secs(1)).await;
+        *v.lock().await = String::from("World");
         drop(v);
     });
 
