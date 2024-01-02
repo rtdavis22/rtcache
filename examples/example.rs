@@ -7,6 +7,7 @@ use thru::Store;
 
 struct TestStore;
 
+// TODO: Use Mutex<String> or RwLock<String> for the values.
 #[async_trait]
 impl Store<i32, String> for TestStore {
     async fn fetch(&self, key: &i32) -> String {

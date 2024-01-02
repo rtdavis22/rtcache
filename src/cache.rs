@@ -255,3 +255,31 @@ where
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct TestStore;
+
+    #[async_trait]
+    impl Store<i32, String> for TestStore {
+        async fn fetch(&self, _key: &i32) -> String {
+            String::from("Hello")
+        }
+
+        async fn update(&self, _key: i32, _value: String) {
+            // if list is dirty, update store
+        }
+    }
+
+    #[tokio::test]
+    async fn it_works() {
+        let mut cache = Cache::new(TestStore).await;
+
+        let v = cache.get(12);
+        drop(v);
+
+        cache.evict_all_sync().await;
+    }
+}
