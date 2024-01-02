@@ -256,30 +256,72 @@ where
     }
 }
 
+impl<K, V> Drop for Cache<K, V> {
+    fn drop(&mut self) {
+        self.evictor_join_handle.abort();
+        self.pruner_join_handle.abort();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    struct TestStore;
+    use tokio::sync::mpsc;
+
+    #[derive(Debug, PartialEq, Eq)]
+    enum StoreOperation {
+        Fetch(i32),
+        Update((i32, String)),
+    }
+
+    struct TestStore {
+        tx: mpsc::UnboundedSender<StoreOperation>,
+    }
 
     #[async_trait]
     impl Store<i32, String> for TestStore {
-        async fn fetch(&self, _key: &i32) -> String {
+        async fn fetch(&self, key: &i32) -> String {
+            self.tx.send(StoreOperation::Fetch(*key)).unwrap();
             String::from("Hello")
         }
 
-        async fn update(&self, _key: i32, _value: String) {
-            // if list is dirty, update store
+        async fn update(&self, key: i32, value: String) {
+            self.tx.send(StoreOperation::Update((key, value))).unwrap();
         }
     }
 
     #[tokio::test]
     async fn it_works() {
-        let mut cache = Cache::new(TestStore).await;
+        let (tx, mut rx) = mpsc::unbounded_channel();
 
-        let v = cache.get(12);
-        drop(v);
+        let mut cache = Cache::new(TestStore { tx }).await;
+
+        {
+            let v = cache.get(10).await.unwrap();
+            assert_eq!("Hello", *v);
+            let v = cache.get(10).await.unwrap();
+            assert_eq!("Hello", *v);
+        }
 
         cache.evict_all_sync().await;
+
+        drop(cache);
+
+        tokio::spawn(async move {
+            let mut operations = vec![];
+            while let Some(op) = rx.recv().await {
+                operations.push(op);
+            }
+            assert_eq!(
+                vec![
+                    StoreOperation::Fetch(10),
+                    StoreOperation::Update((10, "Hello".to_string()))
+                ],
+                operations
+            );
+        })
+        .await
+        .unwrap();
     }
 }
