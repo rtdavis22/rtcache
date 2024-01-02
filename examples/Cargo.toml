@@ -1,0 +1,13 @@
+[package]
+name = "examples"
+version = "0.1.0"
+edition = "2021"
+
+[dev-dependencies]
+thru = { path = "../thru" }
+
+tokio = { version = "1.35.0", features = ["full"] }
+
+[[example]]
+name = "example"
+path = "src/example.rs"

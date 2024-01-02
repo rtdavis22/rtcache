@@ -1,162 +1,241 @@
-use std::hash::Hash;
+// TODO:
+// 1. Replace Mutex<String> with T
+// 2. Support Fetchers and Stores
+// 3. Add examples and unit tests
+// 4. Docs
+// 5. Support other common functionality.
+// 6. Clean up join handle stuff.
+// 7. Support ttl/access ttl (see moka)
+
+use std::collections::{hash_map, HashMap};
 use std::sync::Arc;
 
-use async_trait::async_trait;
-use moka::future::FutureExt;
-use moka::notification::ListenerFuture;
+use tokio::sync::{broadcast, mpsc, Mutex};
+use tokio::time::{sleep, Duration};
 
-pub struct Cache<K, V> {
-    cache: moka::future::Cache<K, Arc<V>>,
-    store: Arc<dyn Store<K, V>>,
-    //background_task: tokio::task::JoinHandle<()>,
+#[derive(Debug)]
+pub enum CacheEntry {
+    Fetching(broadcast::Sender<Result<Arc<Mutex<String>>, FetchError>>),
+    Value(Arc<Mutex<String>>),
 }
 
-impl<K, V> Cache<K, V>
-where
-    K: Hash + Eq + Send + Sync + 'static,
-    V: std::fmt::Debug + Clone + Send + Sync + 'static,
-{
-    pub async fn new(store: impl Store<K, V> + Send + Sync + 'static) -> Self {
-        let store = Arc::new(store);
+#[derive(Debug)]
+pub struct Cache {
+    data: Arc<Mutex<HashMap<i32, CacheEntry>>>,
+    evict_tx: mpsc::UnboundedSender<Mutex<String>>,
+    evictor_join_handle: tokio::task::JoinHandle<()>,
+    pruner_join_handle: tokio::task::JoinHandle<()>,
+}
 
-        let store_clone = store.clone();
-        let eviction_listener = move |k: Arc<K>, mut v: Arc<V>, _cause| -> ListenerFuture {
-            let store = store_clone.clone();
-            async move {
-                // wait until ref count is 1?
-                tokio::spawn(async move {
-                    loop {
-                        println!(
-                            "[Eviction Listener] Strong count: {}",
-                            Arc::strong_count(&v)
-                        );
-                        match Arc::try_unwrap(v) {
-                            Ok(v) => {
-                                store.update(k, v).await;
-                                break;
-                            }
-                            Err(arc) => {
-                                v = arc;
-                            }
-                        }
-                        tokio::time::sleep(tokio::time::Duration::from_secs(4)).await;
-                    }
-                })
-                .await
-                .unwrap();
-            }
-            .boxed()
-        };
+#[derive(Clone, Debug)]
+pub enum FetchError {
+    NotFound,
+}
 
-        let cache: moka::future::Cache<K, Arc<V>> =
-            moka::future::CacheBuilder::<K, Arc<V>, _>::new(10_000)
-                .async_eviction_listener(eviction_listener)
-                //.support_invalidation_closures()
-                .build();
+impl Cache {
+    pub async fn new() -> Self {
+        let data = Arc::new(Mutex::new(HashMap::new()));
 
-        /*
-        let cache_clone = cache.clone();
-        tokio::spawn(async move {
-            loop {
-                println!("Invalidating...");
-                tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
-                cache_clone
-                    .invalidate_entries_if(move |_k, v| Arc::strong_count(v) == 1)
-                    .unwrap();
-            }
-        });
-        */
+        let (evict_tx, evict_rx) = mpsc::unbounded_channel();
 
-        //tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
+        let evictor_join_handle = Self::evictor_join_handle(evict_rx);
+
+        let pruner_join_handle = Self::pruner_join_handle(data.clone(), evict_tx.clone());
 
         Self {
-            cache,
-            store,
-            //background_task,
+            data,
+            evict_tx,
+            evictor_join_handle,
+            pruner_join_handle,
         }
     }
 
-    pub async fn get(&self, key: &K) -> Arc<V>
-    where
-        K: ToOwned<Owned = K>,
-    {
-        self.cache
-            .get_with_by_ref(key, async move { Arc::new(self.store.fetch(key).await) })
+    pub async fn get(&self, k: i32) -> Result<Arc<Mutex<String>>, FetchError> {
+        let data = self.data.clone();
+        let mut lock = self.data.lock().await;
+
+        match lock.get(&k) {
+            None => {
+                let (tx, mut rx) = broadcast::channel(1);
+                lock.insert(k, CacheEntry::Fetching(tx.clone()));
+                drop(lock);
+
+                tokio::spawn(async move {
+                    let fetch_result = if k % 2 == 0 {
+                        Ok(Arc::new(Mutex::new(String::from("Hello"))))
+                    } else {
+                        Err(FetchError::NotFound)
+                    };
+
+                    let mut data = data.lock().await;
+                    let result = match data.entry(k) {
+                        hash_map::Entry::Occupied(mut e) => match e.get() {
+                            // This could mean that the key was inserted while the
+                            // fetch was happening. In this case, we ignore the fetched
+                            // value and return the inserted value.
+                            CacheEntry::Value(arc) => Ok(arc.clone()),
+                            CacheEntry::Fetching(_) => {
+                                if let Ok(res) = fetch_result.clone() {
+                                    e.insert(CacheEntry::Value(res));
+                                } else {
+                                    e.remove();
+                                }
+                                fetch_result
+                            }
+                        },
+                        // This can happen if the value in the cache was deleted while
+                        // the fetch was happening.
+                        hash_map::Entry::Vacant(_) => Err(FetchError::NotFound),
+                    };
+                    drop(data);
+
+                    let _ = tx.send(result);
+                });
+
+                rx.recv().await.unwrap()
+            }
+            Some(CacheEntry::Fetching(tx)) => tx.subscribe().recv().await.unwrap(),
+            Some(CacheEntry::Value(v)) => Ok(v.clone()),
+        }
+    }
+
+    pub async fn insert(&self, k: i32, v: Arc<Mutex<String>>) {
+        self.data
+            .clone()
+            .lock()
             .await
-    }
-}
-
-#[async_trait]
-pub trait Store<K, V> {
-    async fn fetch(&self, key: &K) -> V;
-    async fn update(&self, key: Arc<K>, value: V);
-}
-
-// what if entry evicted from cache and there's still a cloned arc out there?
-// should we stop the eviction?
-// maybe the cache shouldn't evict at all and we should do
-// all invalidations manually?
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use tokio::sync::RwLock;
-
-    struct RwLockWrapper<T> {
-        lock: RwLock<T>,
+            .insert(k, CacheEntry::Value(v));
     }
 
-    struct TestArcStore;
+    // Returns false if the key can't be evicted because the reference
+    // count of the Arc is not one.
+    async fn try_evict_without_lock(
+        &self,
+        k: i32,
+        lock: &mut tokio::sync::MutexGuard<'_, HashMap<i32, CacheEntry>>,
+    ) -> bool {
+        //let data = self.data.clone();
+        //let mut lock = data.lock().await;
 
-    #[async_trait]
-    impl Store<i32, String> for TestArcStore {
-        async fn fetch(&self, _key: &i32) -> String {
-            println!("Fetching...");
-            String::from("Hello")
-        }
-
-        async fn update(&self, _key: Arc<i32>, _value: String) {
-            println!("Updating...");
-            // if list is dirty, update store
-        }
-    }
-
-    #[tokio::test]
-    async fn it_works() {
-        let cache = Cache::new(TestArcStore).await;
-
-        {
-            let v = cache.get(&12).await;
-            println!("[1] Strong count: {}", Arc::strong_count(&v));
-        }
-
-        if let Some(v) = cache.cache.remove(&12).await {
-            cache.cache.run_pending_tasks().await;
-            println!("Strong count: {}", Arc::strong_count(&v));
-        }
-
-        //let v = cache.get(&12).await;
-        //drop(v);
-
-        cache.cache.invalidate_all();
-        cache.cache.run_pending_tasks().await;
-
-        tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
-        /*
-                //for i in 1..10 {
-                //    tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
-                //    let _ = cache.get(&12).await;
-                //}
-
-                //cache.cache.invalidate(&12).await;
-                //
-                let cache2 = moka::future::Cache::new(10);
-                cache2.insert(10, Arc::new(String::from("hello"))).await;
-
-                if let Some(v) = cache2.remove(&10).await {
-                    cache2.run_pending_tasks().await;
-                    println!("Strong count: {}", Arc::strong_count(&v));
+        match lock.entry(k) {
+            hash_map::Entry::Vacant(_) => true,
+            hash_map::Entry::Occupied(e) => match e.get() {
+                CacheEntry::Fetching(_) => {
+                    e.remove();
+                    true
                 }
-        */
+                CacheEntry::Value(_) => {
+                    let (k, v) = e.remove_entry();
+                    if let CacheEntry::Value(v) = v {
+                        match Arc::try_unwrap(v) {
+                            Ok(v) => {
+                                self.evict_tx.send(v).unwrap();
+                                true
+                            }
+                            Err(arc) => {
+                                lock.insert(k, CacheEntry::Value(arc));
+                                false
+                            }
+                        }
+                    } else {
+                        true
+                    }
+                }
+            },
+        }
+    }
+
+    pub async fn try_evict(&self, k: i32) -> bool {
+        let data = self.data.clone();
+        let mut lock = data.lock().await;
+        self.try_evict_without_lock(k, &mut lock).await
+    }
+
+    pub async fn evict_all_sync(&mut self) {
+        let data_clone = self.data.clone();
+
+        // Make sure to hold the lock until the end of the function.
+        let mut data = self.data.lock().await;
+        loop {
+            println!("Cache: {:#?}", self);
+
+            let keys: Vec<_> = data.keys().copied().collect();
+            if keys.is_empty() {
+                break;
+            }
+
+            for key in keys {
+                self.try_evict_without_lock(key, &mut data).await;
+            }
+
+            sleep(Duration::from_secs(1)).await;
+        }
+
+        // At this point, the cache is empty and we need to wait for the evictor
+        // to finish. To do this, we construct a new evictor_join_handle
+        // and .await on the old one. This requires constructing a new channel
+        // and a new pruner_join_handle.
+
+        let (new_evict_tx, new_evict_rx) = mpsc::unbounded_channel();
+        let new_pruner_join_handle = Self::pruner_join_handle(data_clone, new_evict_tx.clone());
+
+        drop(std::mem::replace(&mut self.evict_tx, new_evict_tx));
+
+        let new_evictor_join_handle = Self::evictor_join_handle(new_evict_rx);
+
+        // Abort the old pruner so its evict_tx is dropped,
+        // allowing the old evictor to complete.
+        self.pruner_join_handle.abort();
+        self.pruner_join_handle = new_pruner_join_handle;
+
+        // Replace the evictor and wait for the old evictor to evict everything.
+        std::mem::replace(&mut self.evictor_join_handle, new_evictor_join_handle)
+            .await
+            .unwrap();
+    }
+
+    pub fn evictor_join_handle(
+        mut rx: mpsc::UnboundedReceiver<Mutex<String>>,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            while let Some(v) = rx.recv().await {
+                println!("Evicting {:#?}\n", v);
+            }
+        })
+    }
+
+    fn pruner_join_handle(
+        data: Arc<Mutex<HashMap<i32, CacheEntry>>>,
+        tx: mpsc::UnboundedSender<Mutex<String>>,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            loop {
+                // iterate over all entries. if CacheEntry::Value
+                // and arc count is 1 (and idle for long time) then
+                // evict
+                let mut data = data.lock().await;
+                let keys: Vec<_> = data.keys().copied().collect();
+                for key in keys {
+                    let entry = data.entry(key);
+                    if let hash_map::Entry::Occupied(e) = entry {
+                        if matches!(e.get(), CacheEntry::Value(_)) {
+                            let (k, v) = e.remove_entry();
+                            if let CacheEntry::Value(v) = v {
+                                match Arc::try_unwrap(v) {
+                                    Ok(v) => {
+                                        tx.send(v).unwrap();
+                                    }
+                                    Err(arc) => {
+                                        data.insert(k, CacheEntry::Value(arc));
+                                    }
+                                };
+                            }
+                        }
+                    }
+                }
+                drop(data);
+                sleep(Duration::from_secs(10)).await;
+            }
+        })
     }
 }
