@@ -24,7 +24,7 @@ impl Store<i32, Mutex<String>> for TestStore {
 async fn main() -> Result<(), Box<dyn Error>> {
     let mut cache = thru::Cache::new(TestStore).await;
 
-    let v = cache.get(12).await.unwrap();
+    let v = cache.get(12).await;
 
     tokio::spawn(async move {
         sleep(Duration::from_secs(1)).await;

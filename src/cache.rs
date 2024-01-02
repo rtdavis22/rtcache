@@ -22,22 +22,16 @@ pub trait Store<K, V> {
 
 #[derive(Debug)]
 pub enum CacheEntry<V> {
-    Fetching(broadcast::Sender<Result<Arc<V>, FetchError>>),
+    Fetching(broadcast::Sender<Arc<V>>),
     Value(Arc<V>),
 }
 
-//#[derive(Debug)]
 pub struct Cache<K, V> {
     data: Arc<Mutex<HashMap<K, CacheEntry<V>>>>,
     evict_tx: mpsc::UnboundedSender<(K, V)>,
     evictor_join_handle: tokio::task::JoinHandle<()>,
     pruner_join_handle: tokio::task::JoinHandle<()>,
     store: Arc<dyn Store<K, V> + Send + Sync>,
-}
-
-#[derive(Clone, Debug)]
-pub enum FetchError {
-    NotFound,
 }
 
 impl<K, V> Cache<K, V>
@@ -65,7 +59,7 @@ where
         }
     }
 
-    pub async fn get(&self, k: K) -> Result<Arc<V>, FetchError> {
+    pub async fn get(&self, k: K) -> Arc<V> {
         let data = self.data.clone();
         let mut lock = self.data.lock().await;
 
@@ -77,7 +71,7 @@ where
 
                 let store_clone = self.store.clone();
                 tokio::spawn(async move {
-                    let fetch_result = Ok(Arc::new(store_clone.fetch(&k).await));
+                    let fetch_result = Arc::new(store_clone.fetch(&k).await);
 
                     let mut data = data.lock().await;
                     let result = match data.entry(k) {
@@ -85,19 +79,18 @@ where
                             // This could mean that the key was inserted while the
                             // fetch was happening. In this case, we ignore the fetched
                             // value and return the inserted value.
-                            CacheEntry::Value(arc) => Ok(arc.clone()),
+                            CacheEntry::Value(arc) => arc.clone(),
                             CacheEntry::Fetching(_) => {
-                                if let Ok(res) = fetch_result.clone() {
-                                    e.insert(CacheEntry::Value(res));
-                                } else {
-                                    e.remove();
-                                }
+                                e.insert(CacheEntry::Value(fetch_result.clone()));
                                 fetch_result
                             }
                         },
                         // This can happen if the value in the cache was deleted while
                         // the fetch was happening.
-                        hash_map::Entry::Vacant(_) => Err(FetchError::NotFound),
+                        hash_map::Entry::Vacant(e) => {
+                            e.insert(CacheEntry::Value(fetch_result.clone()));
+                            fetch_result
+                        }
                     };
                     drop(data);
 
@@ -107,7 +100,7 @@ where
                 rx.recv().await.unwrap()
             }
             Some(CacheEntry::Fetching(tx)) => tx.subscribe().recv().await.unwrap(),
-            Some(CacheEntry::Value(v)) => Ok(v.clone()),
+            Some(CacheEntry::Value(v)) => v.clone(),
         }
     }
 
@@ -126,9 +119,6 @@ where
         k: K,
         lock: &mut tokio::sync::MutexGuard<'_, HashMap<K, CacheEntry<V>>>,
     ) -> bool {
-        //let data = self.data.clone();
-        //let mut lock = data.lock().await;
-
         match lock.entry(k) {
             hash_map::Entry::Vacant(_) => true,
             hash_map::Entry::Occupied(e) => match e.get() {
@@ -298,9 +288,9 @@ mod tests {
         let mut cache = Cache::new(TestStore { tx }).await;
 
         {
-            let v = cache.get(10).await.unwrap();
+            let v = cache.get(10).await;
             assert_eq!("Hello", *v);
-            let v = cache.get(10).await.unwrap();
+            let v = cache.get(10).await;
             assert_eq!("Hello", *v);
         }
 
