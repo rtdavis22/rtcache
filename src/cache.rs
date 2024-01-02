@@ -1,6 +1,6 @@
 // TODO:
-// 1. Replace Mutex<String> with T
-// 2. Support Fetchers and Stores
+// X Replace Mutex<String> with T
+// X Support Fetchers and Stores
 // 3. Add examples and unit tests
 // 4. Docs
 // 5. Support other common functionality.
@@ -10,21 +10,29 @@
 use std::collections::{hash_map, HashMap};
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use tokio::sync::{broadcast, mpsc, Mutex};
 use tokio::time::{sleep, Duration};
 
-#[derive(Debug)]
-pub enum CacheEntry {
-    Fetching(broadcast::Sender<Result<Arc<Mutex<String>>, FetchError>>),
-    Value(Arc<Mutex<String>>),
+#[async_trait]
+pub trait Store<K, V> {
+    async fn fetch(&self, key: &K) -> V;
+    async fn update(&self, key: K, value: V);
 }
 
 #[derive(Debug)]
-pub struct Cache {
-    data: Arc<Mutex<HashMap<i32, CacheEntry>>>,
-    evict_tx: mpsc::UnboundedSender<Mutex<String>>,
+pub enum CacheEntry<V> {
+    Fetching(broadcast::Sender<Result<Arc<V>, FetchError>>),
+    Value(Arc<V>),
+}
+
+//#[derive(Debug)]
+pub struct Cache<K, V> {
+    data: Arc<Mutex<HashMap<K, CacheEntry<V>>>>,
+    evict_tx: mpsc::UnboundedSender<(K, V)>,
     evictor_join_handle: tokio::task::JoinHandle<()>,
     pruner_join_handle: tokio::task::JoinHandle<()>,
+    store: Arc<dyn Store<K, V> + Send + Sync>,
 }
 
 #[derive(Clone, Debug)]
@@ -32,13 +40,19 @@ pub enum FetchError {
     NotFound,
 }
 
-impl Cache {
-    pub async fn new() -> Self {
+impl<K, V> Cache<K, V>
+where
+    K: std::fmt::Debug + Copy + std::hash::Hash + Eq + Send + Sync + 'static,
+    V: std::fmt::Debug + Clone + Send + Sync + 'static,
+{
+    pub async fn new(store: impl Store<K, V> + Send + Sync + 'static) -> Self {
+        let store = Arc::new(store);
+
         let data = Arc::new(Mutex::new(HashMap::new()));
 
         let (evict_tx, evict_rx) = mpsc::unbounded_channel();
 
-        let evictor_join_handle = Self::evictor_join_handle(evict_rx);
+        let evictor_join_handle = Self::evictor_join_handle(evict_rx, store.clone());
 
         let pruner_join_handle = Self::pruner_join_handle(data.clone(), evict_tx.clone());
 
@@ -47,10 +61,11 @@ impl Cache {
             evict_tx,
             evictor_join_handle,
             pruner_join_handle,
+            store,
         }
     }
 
-    pub async fn get(&self, k: i32) -> Result<Arc<Mutex<String>>, FetchError> {
+    pub async fn get(&self, k: K) -> Result<Arc<V>, FetchError> {
         let data = self.data.clone();
         let mut lock = self.data.lock().await;
 
@@ -60,12 +75,9 @@ impl Cache {
                 lock.insert(k, CacheEntry::Fetching(tx.clone()));
                 drop(lock);
 
+                let store_clone = self.store.clone();
                 tokio::spawn(async move {
-                    let fetch_result = if k % 2 == 0 {
-                        Ok(Arc::new(Mutex::new(String::from("Hello"))))
-                    } else {
-                        Err(FetchError::NotFound)
-                    };
+                    let fetch_result = Ok(Arc::new(store_clone.fetch(&k).await));
 
                     let mut data = data.lock().await;
                     let result = match data.entry(k) {
@@ -99,7 +111,7 @@ impl Cache {
         }
     }
 
-    pub async fn insert(&self, k: i32, v: Arc<Mutex<String>>) {
+    pub async fn insert(&self, k: K, v: Arc<V>) {
         self.data
             .clone()
             .lock()
@@ -111,8 +123,8 @@ impl Cache {
     // count of the Arc is not one.
     async fn try_evict_without_lock(
         &self,
-        k: i32,
-        lock: &mut tokio::sync::MutexGuard<'_, HashMap<i32, CacheEntry>>,
+        k: K,
+        lock: &mut tokio::sync::MutexGuard<'_, HashMap<K, CacheEntry<V>>>,
     ) -> bool {
         //let data = self.data.clone();
         //let mut lock = data.lock().await;
@@ -129,7 +141,7 @@ impl Cache {
                     if let CacheEntry::Value(v) = v {
                         match Arc::try_unwrap(v) {
                             Ok(v) => {
-                                self.evict_tx.send(v).unwrap();
+                                self.evict_tx.send((k, v)).unwrap();
                                 true
                             }
                             Err(arc) => {
@@ -145,7 +157,7 @@ impl Cache {
         }
     }
 
-    pub async fn try_evict(&self, k: i32) -> bool {
+    pub async fn try_evict(&self, k: K) -> bool {
         let data = self.data.clone();
         let mut lock = data.lock().await;
         self.try_evict_without_lock(k, &mut lock).await
@@ -157,15 +169,18 @@ impl Cache {
         // Make sure to hold the lock until the end of the function.
         let mut data = self.data.lock().await;
         loop {
-            println!("Cache: {:#?}", self);
-
             let keys: Vec<_> = data.keys().copied().collect();
             if keys.is_empty() {
                 break;
             }
 
+            let mut all_done = true;
             for key in keys {
-                self.try_evict_without_lock(key, &mut data).await;
+                all_done = all_done && self.try_evict_without_lock(key, &mut data).await;
+            }
+
+            if all_done {
+                break;
             }
 
             sleep(Duration::from_secs(1)).await;
@@ -181,7 +196,7 @@ impl Cache {
 
         drop(std::mem::replace(&mut self.evict_tx, new_evict_tx));
 
-        let new_evictor_join_handle = Self::evictor_join_handle(new_evict_rx);
+        let new_evictor_join_handle = Self::evictor_join_handle(new_evict_rx, self.store.clone());
 
         // Abort the old pruner so its evict_tx is dropped,
         // allowing the old evictor to complete.
@@ -195,18 +210,19 @@ impl Cache {
     }
 
     pub fn evictor_join_handle(
-        mut rx: mpsc::UnboundedReceiver<Mutex<String>>,
+        mut rx: mpsc::UnboundedReceiver<(K, V)>,
+        store: Arc<dyn Store<K, V> + Send + Sync>,
     ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
-            while let Some(v) = rx.recv().await {
-                println!("Evicting {:#?}\n", v);
+            while let Some((k, v)) = rx.recv().await {
+                store.update(k, v).await;
             }
         })
     }
 
     fn pruner_join_handle(
-        data: Arc<Mutex<HashMap<i32, CacheEntry>>>,
-        tx: mpsc::UnboundedSender<Mutex<String>>,
+        data: Arc<Mutex<HashMap<K, CacheEntry<V>>>>,
+        tx: mpsc::UnboundedSender<(K, V)>,
     ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             loop {
@@ -223,7 +239,7 @@ impl Cache {
                             if let CacheEntry::Value(v) = v {
                                 match Arc::try_unwrap(v) {
                                     Ok(v) => {
-                                        tx.send(v).unwrap();
+                                        tx.send((k, v)).unwrap();
                                     }
                                     Err(arc) => {
                                         data.insert(k, CacheEntry::Value(arc));
