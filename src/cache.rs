@@ -99,7 +99,11 @@ where
 
                 rx.recv().await.unwrap()
             }
-            Some(CacheEntry::Fetching(tx)) => tx.subscribe().recv().await.unwrap(),
+            Some(CacheEntry::Fetching(tx)) => {
+                let mut rx = tx.subscribe();
+                drop(lock);
+                rx.recv().await.unwrap()
+            }
             Some(CacheEntry::Value(v)) => v.clone(),
         }
     }
@@ -258,6 +262,8 @@ mod tests {
     use super::*;
 
     use tokio::sync::mpsc;
+    use tokio::task::JoinSet;
+    use tokio::time::{sleep, Duration};
 
     #[derive(Debug, PartialEq, Eq)]
     enum StoreOperation {
@@ -313,5 +319,37 @@ mod tests {
         })
         .await
         .unwrap();
+    }
+
+    struct StoreWithLatency;
+
+    #[async_trait]
+    impl Store<i32, String> for StoreWithLatency {
+        async fn fetch(&self, _key: &i32) -> String {
+            sleep(Duration::from_secs(1)).await;
+            String::from("Hello")
+        }
+
+        async fn update(&self, _key: i32, _value: String) {
+            sleep(Duration::from_secs(1)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn multiple_waiters() {
+        let cache = Arc::new(Cache::new(StoreWithLatency).await);
+
+        let mut tasks = JoinSet::new();
+        for _ in 1..100 {
+            let cache = cache.clone();
+            tasks.spawn(async move {
+                let v = cache.get(1).await;
+                assert_eq!("Hello", *v);
+            });
+        }
+
+        while let Some(res) = tasks.join_next().await {
+            assert!(res.is_ok());
+        }
     }
 }
