@@ -8,6 +8,7 @@
 // 7. Support ttl/access ttl (see moka)
 
 use std::collections::{hash_map, HashMap};
+use std::mem;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -21,9 +22,41 @@ pub trait Store<K, V> {
 }
 
 #[derive(Debug)]
-pub enum CacheEntry<V> {
+struct RealCacheNode<V> {
+    value: Arc<V>,
+}
+
+#[derive(Debug)]
+enum CacheNode<V> {
+    Real(RealCacheNode<V>),
+    Dummy,
+}
+
+impl<V> RealCacheNode<V> {
+    fn try_unwrap(mut self) -> Result<V, Self> {
+        match Arc::try_unwrap(self.value) {
+            Ok(value) => Ok(value),
+            Err(arc) => {
+                self.value = arc;
+                Err(self)
+            }
+        }
+    }
+}
+
+impl<V> CacheNode<V> {
+    fn unwrap(&self) -> &RealCacheNode<V> {
+        match self {
+            Self::Real(real) => real,
+            Self::Dummy => unreachable!(),
+        }
+    }
+}
+
+#[derive(Debug)]
+enum CacheEntry<V> {
     Fetching(broadcast::Sender<Arc<V>>),
-    Value(Arc<V>),
+    Value(CacheNode<V>),
 }
 
 pub struct Cache<K, V> {
@@ -79,16 +112,20 @@ where
                             // This could mean that the key was inserted while the
                             // fetch was happening. In this case, we ignore the fetched
                             // value and return the inserted value.
-                            CacheEntry::Value(arc) => arc.clone(),
+                            CacheEntry::Value(node) => node.unwrap().value.clone(),
                             CacheEntry::Fetching(_) => {
-                                e.insert(CacheEntry::Value(fetch_result.clone()));
+                                e.insert(CacheEntry::Value(CacheNode::Real(RealCacheNode {
+                                    value: fetch_result.clone(),
+                                })));
                                 fetch_result
                             }
                         },
                         // This can happen if the value in the cache was deleted while
                         // the fetch was happening.
                         hash_map::Entry::Vacant(e) => {
-                            e.insert(CacheEntry::Value(fetch_result.clone()));
+                            e.insert(CacheEntry::Value(CacheNode::Real(RealCacheNode {
+                                value: fetch_result.clone(),
+                            })));
                             fetch_result
                         }
                     };
@@ -104,16 +141,15 @@ where
                 drop(lock);
                 rx.recv().await.unwrap()
             }
-            Some(CacheEntry::Value(v)) => v.clone(),
+            Some(CacheEntry::Value(node)) => node.unwrap().value.clone(),
         }
     }
 
     pub async fn insert(&self, k: K, v: Arc<V>) {
-        self.data
-            .clone()
-            .lock()
-            .await
-            .insert(k, CacheEntry::Value(v));
+        self.data.clone().lock().await.insert(
+            k,
+            CacheEntry::Value(CacheNode::Real(RealCacheNode { value: v })),
+        );
     }
 
     // Returns false if the key can't be evicted because the reference
@@ -125,28 +161,27 @@ where
     ) -> bool {
         match lock.entry(k) {
             hash_map::Entry::Vacant(_) => true,
-            hash_map::Entry::Occupied(e) => match e.get() {
+            hash_map::Entry::Occupied(mut e) => match e.get_mut() {
                 CacheEntry::Fetching(_) => {
                     e.remove();
                     true
                 }
-                CacheEntry::Value(_) => {
-                    let (k, v) = e.remove_entry();
-                    if let CacheEntry::Value(v) = v {
-                        match Arc::try_unwrap(v) {
-                            Ok(v) => {
-                                self.evict_tx.send((k, v)).unwrap();
-                                true
-                            }
-                            Err(arc) => {
-                                lock.insert(k, CacheEntry::Value(arc));
-                                false
-                            }
+                CacheEntry::Value(node) => match mem::replace(node, CacheNode::Dummy) {
+                    CacheNode::Real(real_node) => match RealCacheNode::try_unwrap(real_node) {
+                        Ok(v) => {
+                            e.remove();
+                            self.evict_tx.send((k, v)).unwrap();
+                            true
                         }
-                    } else {
-                        true
-                    }
-                }
+                        Err(real_node) => {
+                            // If the unwrap wasn't successful, replace the dummy cache node
+                            // with the real cache node.
+                            *node = CacheNode::Real(real_node);
+                            false
+                        }
+                    },
+                    CacheNode::Dummy => false,
+                },
             },
         }
     }
@@ -227,18 +262,21 @@ where
                 let keys: Vec<_> = data.keys().copied().collect();
                 for key in keys {
                     let entry = data.entry(key);
-                    if let hash_map::Entry::Occupied(e) = entry {
-                        if matches!(e.get(), CacheEntry::Value(_)) {
-                            let (k, v) = e.remove_entry();
-                            if let CacheEntry::Value(v) = v {
-                                match Arc::try_unwrap(v) {
-                                    Ok(v) => {
-                                        tx.send((k, v)).unwrap();
+                    if let hash_map::Entry::Occupied(mut e) = entry {
+                        if let CacheEntry::Value(ref mut node) = e.get_mut() {
+                            match mem::replace(node, CacheNode::Dummy) {
+                                CacheNode::Real(real_node) => {
+                                    match RealCacheNode::try_unwrap(real_node) {
+                                        Ok(v) => {
+                                            e.remove();
+                                            tx.send((key, v)).unwrap()
+                                        }
+                                        Err(real_node) => {
+                                            *node = CacheNode::Real(real_node);
+                                        }
                                     }
-                                    Err(arc) => {
-                                        data.insert(k, CacheEntry::Value(arc));
-                                    }
-                                };
+                                }
+                                CacheNode::Dummy => (),
                             }
                         }
                     }
