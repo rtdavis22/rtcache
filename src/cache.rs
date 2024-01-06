@@ -68,7 +68,7 @@ impl<V> CacheNode<V> {
 #[derive(Debug)]
 enum CacheEntry<V> {
     Fetching(broadcast::Sender<Arc<V>>),
-    Value(CacheNode<V>),
+    Node(CacheNode<V>),
 }
 
 pub struct Cache<K, V> {
@@ -128,16 +128,16 @@ where
                             // This could mean that the key was inserted while the
                             // fetch was happening. In this case, we ignore the fetched
                             // value and return the inserted value.
-                            CacheEntry::Value(node) => node.unwrap().value.clone(),
+                            CacheEntry::Node(node) => node.unwrap().value.clone(),
                             CacheEntry::Fetching(_) => {
-                                e.insert(CacheEntry::Value(CacheNode::new(fetch_result.clone())));
+                                e.insert(CacheEntry::Node(CacheNode::new(fetch_result.clone())));
                                 fetch_result
                             }
                         },
                         // This can happen if the value in the cache was deleted while
                         // the fetch was happening.
                         hash_map::Entry::Vacant(e) => {
-                            e.insert(CacheEntry::Value(CacheNode::new(fetch_result.clone())));
+                            e.insert(CacheEntry::Node(CacheNode::new(fetch_result.clone())));
                             fetch_result
                         }
                     };
@@ -153,7 +153,7 @@ where
                 drop(lock);
                 rx.recv().await.unwrap()
             }
-            Some(CacheEntry::Value(node)) => node.unwrap().value.clone(),
+            Some(CacheEntry::Node(node)) => node.unwrap().value.clone(),
         }
     }
 
@@ -162,7 +162,7 @@ where
             .clone()
             .lock()
             .await
-            .insert(k, CacheEntry::Value(CacheNode::new(v)));
+            .insert(k, CacheEntry::Node(CacheNode::new(v)));
     }
 
     // Returns false if the key can't be evicted because the reference
@@ -179,7 +179,7 @@ where
                     e.remove();
                     true
                 }
-                CacheEntry::Value(node) => match mem::replace(node, CacheNode::Dummy) {
+                CacheEntry::Node(node) => match mem::replace(node, CacheNode::Dummy) {
                     CacheNode::Real(real_node) => match RealCacheNode::try_unwrap(real_node) {
                         Ok(v) => {
                             e.remove();
@@ -279,7 +279,7 @@ where
                 for key in keys {
                     let entry = data.entry(key);
                     if let hash_map::Entry::Occupied(mut e) = entry {
-                        if let CacheEntry::Value(ref mut node) = e.get_mut() {
+                        if let CacheEntry::Node(ref mut node) = e.get_mut() {
                             if now.duration_since(node.unwrap().last_access_ts) < access_ttl {
                                 continue;
                             }
