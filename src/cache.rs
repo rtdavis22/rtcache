@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use tokio::sync::{broadcast, mpsc, Mutex};
-use tokio::time::{sleep, Duration};
+use tokio::time::{sleep, Duration, Instant};
 
 #[async_trait]
 pub trait Store<K, V> {
@@ -24,15 +24,17 @@ pub trait Store<K, V> {
 #[derive(Debug)]
 struct RealCacheNode<V> {
     value: Arc<V>,
-}
-
-#[derive(Debug)]
-enum CacheNode<V> {
-    Real(RealCacheNode<V>),
-    Dummy,
+    last_access_ts: Instant,
 }
 
 impl<V> RealCacheNode<V> {
+    fn new(value: Arc<V>) -> Self {
+        Self {
+            value,
+            last_access_ts: Instant::now(),
+        }
+    }
+
     fn try_unwrap(mut self) -> Result<V, Self> {
         match Arc::try_unwrap(self.value) {
             Ok(value) => Ok(value),
@@ -44,7 +46,17 @@ impl<V> RealCacheNode<V> {
     }
 }
 
+#[derive(Debug)]
+enum CacheNode<V> {
+    Real(RealCacheNode<V>),
+    Dummy,
+}
+
 impl<V> CacheNode<V> {
+    fn new(value: Arc<V>) -> Self {
+        Self::Real(RealCacheNode::new(value))
+    }
+
     fn unwrap(&self) -> &RealCacheNode<V> {
         match self {
             Self::Real(real) => real,
@@ -65,6 +77,7 @@ pub struct Cache<K, V> {
     evictor_join_handle: tokio::task::JoinHandle<()>,
     pruner_join_handle: tokio::task::JoinHandle<()>,
     store: Arc<dyn Store<K, V> + Send + Sync>,
+    access_ttl: Duration,
 }
 
 impl<K, V> Cache<K, V>
@@ -81,7 +94,9 @@ where
 
         let evictor_join_handle = Self::evictor_join_handle(evict_rx, store.clone());
 
-        let pruner_join_handle = Self::pruner_join_handle(data.clone(), evict_tx.clone());
+        let access_ttl = Duration::from_secs(10);
+        let pruner_join_handle =
+            Self::pruner_join_handle(data.clone(), evict_tx.clone(), access_ttl);
 
         Self {
             data,
@@ -89,6 +104,7 @@ where
             evictor_join_handle,
             pruner_join_handle,
             store,
+            access_ttl,
         }
     }
 
@@ -114,18 +130,14 @@ where
                             // value and return the inserted value.
                             CacheEntry::Value(node) => node.unwrap().value.clone(),
                             CacheEntry::Fetching(_) => {
-                                e.insert(CacheEntry::Value(CacheNode::Real(RealCacheNode {
-                                    value: fetch_result.clone(),
-                                })));
+                                e.insert(CacheEntry::Value(CacheNode::new(fetch_result.clone())));
                                 fetch_result
                             }
                         },
                         // This can happen if the value in the cache was deleted while
                         // the fetch was happening.
                         hash_map::Entry::Vacant(e) => {
-                            e.insert(CacheEntry::Value(CacheNode::Real(RealCacheNode {
-                                value: fetch_result.clone(),
-                            })));
+                            e.insert(CacheEntry::Value(CacheNode::new(fetch_result.clone())));
                             fetch_result
                         }
                     };
@@ -146,10 +158,11 @@ where
     }
 
     pub async fn insert(&self, k: K, v: Arc<V>) {
-        self.data.clone().lock().await.insert(
-            k,
-            CacheEntry::Value(CacheNode::Real(RealCacheNode { value: v })),
-        );
+        self.data
+            .clone()
+            .lock()
+            .await
+            .insert(k, CacheEntry::Value(CacheNode::new(v)));
     }
 
     // Returns false if the key can't be evicted because the reference
@@ -221,7 +234,8 @@ where
         // and a new pruner_join_handle.
 
         let (new_evict_tx, new_evict_rx) = mpsc::unbounded_channel();
-        let new_pruner_join_handle = Self::pruner_join_handle(data_clone, new_evict_tx.clone());
+        let new_pruner_join_handle =
+            Self::pruner_join_handle(data_clone, new_evict_tx.clone(), self.access_ttl);
 
         drop(std::mem::replace(&mut self.evict_tx, new_evict_tx));
 
@@ -252,6 +266,7 @@ where
     fn pruner_join_handle(
         data: Arc<Mutex<HashMap<K, CacheEntry<V>>>>,
         tx: mpsc::UnboundedSender<(K, V)>,
+        access_ttl: Duration,
     ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             loop {
@@ -260,10 +275,14 @@ where
                 // evict
                 let mut data = data.lock().await;
                 let keys: Vec<_> = data.keys().copied().collect();
+                let now = Instant::now();
                 for key in keys {
                     let entry = data.entry(key);
                     if let hash_map::Entry::Occupied(mut e) = entry {
                         if let CacheEntry::Value(ref mut node) = e.get_mut() {
+                            if now.duration_since(node.unwrap().last_access_ts) < access_ttl {
+                                continue;
+                            }
                             match mem::replace(node, CacheNode::Dummy) {
                                 CacheNode::Real(real_node) => {
                                     match RealCacheNode::try_unwrap(real_node) {
