@@ -44,6 +44,10 @@ impl<V> RealCacheNode<V> {
             }
         }
     }
+
+    fn bump_access_time(&mut self) {
+        self.last_access_ts = Instant::now();
+    }
 }
 
 #[derive(Debug)]
@@ -58,6 +62,13 @@ impl<V> CacheNode<V> {
     }
 
     fn unwrap(&self) -> &RealCacheNode<V> {
+        match self {
+            Self::Real(real) => real,
+            Self::Dummy => unreachable!(),
+        }
+    }
+
+    fn unwrap_mut(&mut self) -> &mut RealCacheNode<V> {
         match self {
             Self::Real(real) => real,
             Self::Dummy => unreachable!(),
@@ -112,7 +123,7 @@ where
         let data = self.data.clone();
         let mut lock = self.data.lock().await;
 
-        match lock.get(&k) {
+        match lock.get_mut(&k) {
             None => {
                 let (tx, mut rx) = broadcast::channel(1);
                 lock.insert(k, CacheEntry::Fetching(tx.clone()));
@@ -124,11 +135,15 @@ where
 
                     let mut data = data.lock().await;
                     let result = match data.entry(k) {
-                        hash_map::Entry::Occupied(mut e) => match e.get() {
+                        hash_map::Entry::Occupied(mut e) => match e.get_mut() {
                             // This could mean that the key was inserted while the
                             // fetch was happening. In this case, we ignore the fetched
                             // value and return the inserted value.
-                            CacheEntry::Node(node) => node.unwrap().value.clone(),
+                            CacheEntry::Node(ref mut node) => {
+                                let real_node = node.unwrap_mut();
+                                real_node.bump_access_time();
+                                real_node.value.clone()
+                            }
                             CacheEntry::Fetching(_) => {
                                 e.insert(CacheEntry::Node(CacheNode::new(fetch_result.clone())));
                                 fetch_result
@@ -153,13 +168,16 @@ where
                 drop(lock);
                 rx.recv().await.unwrap()
             }
-            Some(CacheEntry::Node(node)) => node.unwrap().value.clone(),
+            Some(CacheEntry::Node(ref mut node)) => {
+                let real_node = node.unwrap_mut();
+                real_node.bump_access_time();
+                real_node.value.clone()
+            }
         }
     }
 
     pub async fn insert(&self, k: K, v: Arc<V>) {
         self.data
-            .clone()
             .lock()
             .await
             .insert(k, CacheEntry::Node(CacheNode::new(v)));
