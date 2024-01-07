@@ -8,6 +8,8 @@
 // 7. Support ttl/access ttl (see moka)
 
 use std::collections::{hash_map, HashMap};
+use std::fmt;
+use std::io;
 use std::mem;
 use std::sync::Arc;
 
@@ -87,13 +89,14 @@ pub struct Cache<K, V> {
     evict_tx: mpsc::UnboundedSender<(K, V)>,
     evictor_join_handle: tokio::task::JoinHandle<()>,
     pruner_join_handle: tokio::task::JoinHandle<()>,
+    web_join_handle: tokio::task::JoinHandle<io::Result<()>>,
     store: Arc<dyn Store<K, V> + Send + Sync>,
     access_ttl: Duration,
 }
 
 impl<K, V> Cache<K, V>
 where
-    K: std::hash::Hash + Copy + Eq + Send + Sync + 'static,
+    K: std::hash::Hash + fmt::Display + Copy + Eq + Send + Sync + 'static,
     V: Send + Sync + 'static,
 {
     pub async fn new(store: impl Store<K, V> + Send + Sync + 'static) -> Self {
@@ -105,9 +108,11 @@ where
 
         let evictor_join_handle = Self::evictor_join_handle(evict_rx, store.clone());
 
-        let access_ttl = Duration::from_secs(10);
+        let access_ttl = Duration::from_secs(60);
         let pruner_join_handle =
             Self::pruner_join_handle(data.clone(), evict_tx.clone(), access_ttl);
+
+        let web_join_handle = Self::web_join_handle(data.clone(), access_ttl);
 
         Self {
             data,
@@ -116,6 +121,7 @@ where
             pruner_join_handle,
             store,
             access_ttl,
+            web_join_handle,
         }
     }
 
@@ -323,12 +329,82 @@ where
             }
         })
     }
+
+    fn web_join_handle(
+        data: Arc<Mutex<HashMap<K, CacheEntry<V>>>>,
+        access_ttl: Duration,
+    ) -> tokio::task::JoinHandle<io::Result<()>> {
+        tokio::spawn(async move {
+            let mut app = tide::with_state(data);
+            app.at("/").get(
+                move |req: tide::Request<Arc<Mutex<HashMap<K, CacheEntry<V>>>>>| async move {
+                    let mut table = String::from("<table>");
+                    table.push_str("<tr><th>Key</th><th>Time since last access</th></tr>");
+                    let data = req.state().lock().await;
+                    let now = Instant::now();
+                    for (k, entry) in &*data {
+                        table.push_str("<tr>");
+                        table += &*format!("<td>{}</td>", k);
+                        table += "<td>";
+                        table += &match entry {
+                            CacheEntry::Fetching(_) => String::from("Fetching..."),
+                            CacheEntry::Node(node) => match node {
+                                CacheNode::Real(real_node) => {
+                                    now.duration_since(real_node.last_access_ts)
+                                        .as_secs()
+                                        .to_string()
+                                        + " secs."
+                                }
+                                CacheNode::Dummy => String::from("<Dummy>"),
+                            },
+                        };
+                        table += "</td>";
+                        table.push_str("</tr>");
+                    }
+                    table.push_str("</table>");
+
+                    let response = format!(
+                        "
+                        <html>
+                          <head>
+                            <style>
+                              table {{
+                                width: 100%;
+                                border-collapse: collapse;
+                              }}
+                              td, th {{
+                                border: 1px solid black;
+                                text-align: left;
+                                padding: 8px;
+                              }}
+                            </style>
+                          </head>
+                          <body>
+                            <p>Access TTL: {} secs.</p>
+                            {table}
+                          </body>
+                        </html>
+                    ",
+                        access_ttl.as_secs()
+                    );
+
+                    Ok(tide::Response::builder(200)
+                        .body(response)
+                        .content_type(tide::http::mime::HTML)
+                        .build())
+                },
+            );
+            app.listen("127.0.0.1:8030").await
+        })
+    }
 }
 
 impl<K, V> Drop for Cache<K, V> {
     fn drop(&mut self) {
         self.evictor_join_handle.abort();
         self.pruner_join_handle.abort();
+        // Doesn't kill the server?
+        self.web_join_handle.abort();
     }
 }
 
