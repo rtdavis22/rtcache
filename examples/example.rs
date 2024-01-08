@@ -10,9 +10,9 @@ struct TestStore;
 
 #[async_trait]
 impl Store<i32, Mutex<String>> for TestStore {
-    async fn fetch(&self, key: &i32) -> Mutex<String> {
+    async fn fetch(&self, key: &i32) -> anyhow::Result<Mutex<String>> {
         println!("[Fetch] key: {}", key);
-        Mutex::new(String::from("Hello"))
+        Ok(Mutex::new(String::from("Hello")))
     }
 
     async fn update(&self, key: i32, value: Mutex<String>) {
@@ -24,7 +24,7 @@ impl Store<i32, Mutex<String>> for TestStore {
 async fn main() -> Result<(), Box<dyn Error>> {
     let mut cache = thru::Cache::new(TestStore).await;
 
-    let v = cache.get(12).await;
+    let v = cache.get(12).await.unwrap();
 
     tokio::spawn(async move {
         sleep(Duration::from_secs(1)).await;

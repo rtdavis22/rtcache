@@ -5,9 +5,12 @@
 // 4. Docs
 // 5. Support other common functionality.
 // 6. Clean up join handle stuff.
-// 7. Support ttl/access ttl (see moka)
+// X Support ttl/access ttl (see moka)
+// 8. Store total time in cache (and display in web UI)
+// 9. Config (enabling web ui, access ttl)
 
 use std::collections::{hash_map, HashMap};
+use std::error;
 use std::fmt;
 use std::io;
 use std::mem;
@@ -19,7 +22,7 @@ use tokio::time::{sleep, Duration, Instant};
 
 #[async_trait]
 pub trait Store<K, V> {
-    async fn fetch(&self, key: &K) -> V;
+    async fn fetch(&self, key: &K) -> anyhow::Result<V>;
     async fn update(&self, key: K, value: V);
 }
 
@@ -80,9 +83,29 @@ impl<V> CacheNode<V> {
 
 #[derive(Debug)]
 enum CacheEntry<V> {
-    Fetching(broadcast::Sender<Arc<V>>),
+    Fetching(broadcast::Sender<Result<Arc<V>, Arc<anyhow::Error>>>),
+    FetchFailed(Arc<anyhow::Error>),
     Node(CacheNode<V>),
 }
+
+#[derive(Debug)]
+pub struct GetError {
+    pub fetch_error: Arc<anyhow::Error>,
+}
+
+impl GetError {
+    fn new(fetch_error: Arc<anyhow::Error>) -> Self {
+        Self { fetch_error }
+    }
+}
+
+impl fmt::Display for GetError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Failed to fetch")
+    }
+}
+
+impl error::Error for GetError {}
 
 pub struct Cache<K, V> {
     data: Arc<Mutex<HashMap<K, CacheEntry<V>>>>,
@@ -125,7 +148,7 @@ where
         }
     }
 
-    pub async fn get(&self, k: K) -> Arc<V> {
+    pub async fn get(&self, k: K) -> Result<Arc<V>, GetError> {
         let data = self.data.clone();
         let mut lock = self.data.lock().await;
 
@@ -137,7 +160,7 @@ where
 
                 let store_clone = self.store.clone();
                 tokio::spawn(async move {
-                    let fetch_result = Arc::new(store_clone.fetch(&k).await);
+                    let fetch_result = store_clone.fetch(&k).await.map(Arc::new).map_err(Arc::new);
 
                     let mut data = data.lock().await;
                     let result = match data.entry(k) {
@@ -148,37 +171,52 @@ where
                             CacheEntry::Node(ref mut node) => {
                                 let real_node = node.unwrap_mut();
                                 real_node.bump_access_time();
-                                real_node.value.clone()
+                                Ok(real_node.value.clone())
                             }
-                            CacheEntry::Fetching(_) => {
-                                e.insert(CacheEntry::Node(CacheNode::new(fetch_result.clone())));
-                                fetch_result
+                            CacheEntry::Fetching(_) | CacheEntry::FetchFailed(_) => {
+                                match fetch_result {
+                                    Ok(value) => {
+                                        e.insert(CacheEntry::Node(CacheNode::new(value.clone())));
+                                        Ok(value)
+                                    }
+                                    Err(err) => {
+                                        e.insert(CacheEntry::FetchFailed(err.clone()));
+                                        Err(err)
+                                    }
+                                }
                             }
                         },
                         // This can happen if the value in the cache was deleted while
                         // the fetch was happening.
-                        hash_map::Entry::Vacant(e) => {
-                            e.insert(CacheEntry::Node(CacheNode::new(fetch_result.clone())));
-                            fetch_result
-                        }
+                        hash_map::Entry::Vacant(e) => match fetch_result {
+                            Ok(value) => {
+                                e.insert(CacheEntry::Node(CacheNode::new(value.clone())));
+                                Ok(value)
+                            }
+                            Err(err) => {
+                                e.insert(CacheEntry::FetchFailed(err.clone()));
+                                Err(err)
+                            }
+                        },
                     };
                     drop(data);
 
                     let _ = tx.send(result);
                 });
 
-                rx.recv().await.unwrap()
+                rx.recv().await.unwrap().map_err(GetError::new)
             }
             Some(CacheEntry::Fetching(tx)) => {
                 let mut rx = tx.subscribe();
                 drop(lock);
-                rx.recv().await.unwrap()
+                rx.recv().await.unwrap().map_err(GetError::new)
             }
             Some(CacheEntry::Node(ref mut node)) => {
                 let real_node = node.unwrap_mut();
                 real_node.bump_access_time();
-                real_node.value.clone()
+                Ok(real_node.value.clone())
             }
+            Some(CacheEntry::FetchFailed(e)) => Err(GetError::new(e.clone())),
         }
     }
 
@@ -187,6 +225,10 @@ where
             .lock()
             .await
             .insert(k, CacheEntry::Node(CacheNode::new(v)));
+    }
+
+    pub async fn remove(&self, k: K) {
+        self.data.lock().await.remove(&k);
     }
 
     // Returns false if the key can't be evicted because the reference
@@ -199,7 +241,7 @@ where
         match lock.entry(k) {
             hash_map::Entry::Vacant(_) => true,
             hash_map::Entry::Occupied(mut e) => match e.get_mut() {
-                CacheEntry::Fetching(_) => {
+                CacheEntry::Fetching(_) | CacheEntry::FetchFailed(_) => {
                     e.remove();
                     true
                 }
@@ -357,6 +399,7 @@ where
                                 }
                                 CacheNode::Dummy => String::from("<Dummy>"),
                             },
+                            CacheEntry::FetchFailed(_) => String::from("<Fetch error>"),
                         };
                         table += "</td>";
                         table.push_str("</tr>");
@@ -403,7 +446,7 @@ impl<K, V> Drop for Cache<K, V> {
     fn drop(&mut self) {
         self.evictor_join_handle.abort();
         self.pruner_join_handle.abort();
-        // Doesn't kill the server?
+        // TODO: Use axum which supports graceful shutdown.
         self.web_join_handle.abort();
     }
 }
@@ -428,9 +471,9 @@ mod tests {
 
     #[async_trait]
     impl Store<i32, String> for TestStore {
-        async fn fetch(&self, key: &i32) -> String {
+        async fn fetch(&self, key: &i32) -> anyhow::Result<String> {
             self.tx.send(StoreOperation::Fetch(*key)).unwrap();
-            String::from("Hello")
+            Ok(String::from("Hello"))
         }
 
         async fn update(&self, key: i32, value: String) {
@@ -445,9 +488,9 @@ mod tests {
         let mut cache = Cache::new(TestStore { tx }).await;
 
         {
-            let v = cache.get(10).await;
+            let v = cache.get(10).await.unwrap();
             assert_eq!("Hello", *v);
-            let v = cache.get(10).await;
+            let v = cache.get(10).await.unwrap();
             assert_eq!("Hello", *v);
         }
 
@@ -476,9 +519,9 @@ mod tests {
 
     #[async_trait]
     impl Store<i32, String> for StoreWithLatency {
-        async fn fetch(&self, _key: &i32) -> String {
+        async fn fetch(&self, _key: &i32) -> anyhow::Result<String> {
             sleep(Duration::from_secs(1)).await;
-            String::from("Hello")
+            Ok(String::from("Hello"))
         }
 
         async fn update(&self, _key: i32, _value: String) {
@@ -494,7 +537,7 @@ mod tests {
         for _ in 1..100 {
             let cache = cache.clone();
             tasks.spawn(async move {
-                let v = cache.get(1).await;
+                let v = cache.get(1).await.unwrap();
                 assert_eq!("Hello", *v);
             });
         }
