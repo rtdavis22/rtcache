@@ -29,14 +29,17 @@ pub trait Store<K, V> {
 #[derive(Debug)]
 struct RealCacheNode<V> {
     value: Arc<V>,
+    first_access_ts: Instant,
     last_access_ts: Instant,
 }
 
 impl<V> RealCacheNode<V> {
     fn new(value: Arc<V>) -> Self {
+        let now = Instant::now();
         Self {
             value,
-            last_access_ts: Instant::now(),
+            first_access_ts: now,
+            last_access_ts: now,
         }
     }
 
@@ -381,7 +384,15 @@ where
             app.at("/").get(
                 move |req: tide::Request<Arc<Mutex<HashMap<K, CacheEntry<V>>>>>| async move {
                     let mut table = String::from("<table>");
-                    table.push_str("<tr><th>Key</th><th>Time since last access</th></tr>");
+                    table.push_str(
+                        "
+                        <tr>
+                          <th>Key</th>
+                          <th>Time since last access</th>
+                          <th>Time in cache</th>
+                          <th>Strong count</th>
+                        </tr>",
+                    );
                     let data = req.state().lock().await;
                     let now = Instant::now();
                     for (k, entry) in &*data {
@@ -402,6 +413,19 @@ where
                             CacheEntry::FetchFailed(_) => String::from("<Fetch error>"),
                         };
                         table += "</td>";
+                        if let CacheEntry::Node(CacheNode::Real(real_node)) = entry {
+                            let time_in_cache =
+                                now.duration_since(real_node.first_access_ts).as_secs();
+                            table += &format!("<td>{time_in_cache} secs.</td>");
+                        } else {
+                            table += "<td></td>";
+                        }
+                        if let CacheEntry::Node(CacheNode::Real(real_node)) = entry {
+                            let strong_count = Arc::strong_count(&real_node.value);
+                            table += &format!("<td>{strong_count}</td>");
+                        } else {
+                            table += "<td></td>";
+                        }
                         table.push_str("</tr>");
                     }
                     table.push_str("</table>");
