@@ -15,6 +15,7 @@ use std::fmt;
 use std::future::Future;
 use std::io;
 use std::mem;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use tokio::sync::{broadcast, mpsc, Mutex};
@@ -104,12 +105,11 @@ impl fmt::Display for GetError {
 
 impl error::Error for GetError {}
 
-// TODO: The last 4 shouldn't be type parameters?
-//
-pub struct Cache<K, V, FetchFunc, FetchResult, EvictFunc, EvictResult>
+type FetchFunc<K, V> = Box<dyn Fn(K) -> FetchResult<V> + Send + Sync + 'static>;
+type FetchResult<V> = Pin<Box<dyn Future<Output = anyhow::Result<V>> + Send + Sync + 'static>>;
+
+pub struct Cache<K, V, EvictFunc, EvictResult>
 where
-    FetchResult: Future<Output = anyhow::Result<V>> + Send + Sync + 'static,
-    FetchFunc: Fn(K) -> FetchResult + Send + Sync + 'static,
     EvictResult: Future<Output = ()> + Send + Sync + 'static,
     EvictFunc: Fn(K, V) -> EvictResult + Send + Sync + 'static,
 {
@@ -119,22 +119,23 @@ where
     pruner_join_handle: tokio::task::JoinHandle<()>,
     web_join_handle: tokio::task::JoinHandle<io::Result<()>>,
     access_ttl: Duration,
-    fetch_fn: Arc<FetchFunc>,
+    fetch_fn: Arc<FetchFunc<K, V>>,
     evict_fn: Arc<EvictFunc>,
 }
 
-impl<K, V, FetchFunc, FetchResult, EvictFunc, EvictResult>
-    Cache<K, V, FetchFunc, FetchResult, EvictFunc, EvictResult>
+impl<K, V, EvictFunc, EvictResult> Cache<K, V, EvictFunc, EvictResult>
 where
     K: std::hash::Hash + fmt::Display + Copy + Eq + Send + Sync + 'static,
     V: Send + Sync + 'static,
-    FetchFunc: Fn(K) -> FetchResult + Send + Sync + 'static,
-    FetchResult: Future<Output = anyhow::Result<V>> + Send + Sync + 'static,
     EvictFunc: Fn(K, V) -> EvictResult + Send + Sync + 'static,
     EvictResult: Future<Output = ()> + Send + Sync + 'static,
 {
     // TODO: evict_fn should be optional.
-    pub async fn new(fetch_fn: FetchFunc, evict_fn: EvictFunc) -> Self {
+    pub async fn new<F, Fut>(fetch_fn: F, evict_fn: EvictFunc) -> Self
+    where
+        F: Fn(K) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = anyhow::Result<V>> + Send + Sync + 'static,
+    {
         let evict_fn = Arc::new(evict_fn);
 
         let data = Arc::new(Mutex::new(HashMap::new()));
@@ -149,6 +150,8 @@ where
 
         let web_join_handle = Self::web_join_handle(data.clone(), access_ttl);
 
+        let fetch_fn = Arc::new(fetch_fn);
+
         Self {
             data,
             evict_tx,
@@ -156,7 +159,10 @@ where
             pruner_join_handle,
             access_ttl,
             web_join_handle,
-            fetch_fn: Arc::new(fetch_fn),
+            fetch_fn: Arc::new(Box::new(move |k| {
+                let fetch_fn = fetch_fn.clone();
+                Box::pin(async move { fetch_fn(k).await })
+            })),
             evict_fn,
         }
     }
@@ -480,11 +486,9 @@ where
 impl<
         K,
         V,
-        FetchFunc: Fn(K) -> FetchResult + Send + Sync,
-        FetchResult: Send + Sync + Future<Output = anyhow::Result<V>>,
         EvictFunc: Fn(K, V) -> EvictResult + Send + Sync,
         EvictResult: Future<Output = ()> + Send + Sync,
-    > Drop for Cache<K, V, FetchFunc, FetchResult, EvictFunc, EvictResult>
+    > Drop for Cache<K, V, EvictFunc, EvictResult>
 {
     fn drop(&mut self) {
         self.evictor_join_handle.abort();
