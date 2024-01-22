@@ -106,13 +106,11 @@ impl fmt::Display for GetError {
 impl error::Error for GetError {}
 
 type FetchFunc<K, V> = Box<dyn Fn(K) -> FetchResult<V> + Send + Sync + 'static>;
-type FetchResult<V> = Pin<Box<dyn Future<Output = anyhow::Result<V>> + Send + Sync + 'static>>;
+type FetchResult<V> = Pin<Box<dyn Future<Output = anyhow::Result<V>> + Send + 'static>>;
+type EvictFunc<K, V> = Box<dyn Fn(K, V) -> EvictResult + Send + Sync + 'static>;
+type EvictResult = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 
-pub struct Cache<K, V, EvictFunc, EvictResult>
-where
-    EvictResult: Future<Output = ()> + Send + Sync + 'static,
-    EvictFunc: Fn(K, V) -> EvictResult + Send + Sync + 'static,
-{
+pub struct Cache<K, V> {
     data: Arc<Mutex<HashMap<K, CacheEntry<V>>>>,
     evict_tx: mpsc::UnboundedSender<(K, V)>,
     evictor_join_handle: tokio::task::JoinHandle<()>,
@@ -120,29 +118,40 @@ where
     web_join_handle: tokio::task::JoinHandle<io::Result<()>>,
     access_ttl: Duration,
     fetch_fn: Arc<FetchFunc<K, V>>,
-    evict_fn: Arc<EvictFunc>,
+    evict_fn: Arc<EvictFunc<K, V>>,
 }
 
-impl<K, V, EvictFunc, EvictResult> Cache<K, V, EvictFunc, EvictResult>
+impl<K, V> Cache<K, V>
 where
     K: std::hash::Hash + fmt::Display + Copy + Eq + Send + Sync + 'static,
     V: Send + Sync + 'static,
-    EvictFunc: Fn(K, V) -> EvictResult + Send + Sync + 'static,
-    EvictResult: Future<Output = ()> + Send + Sync + 'static,
 {
     // TODO: evict_fn should be optional.
-    pub async fn new<F, Fut>(fetch_fn: F, evict_fn: EvictFunc) -> Self
+    pub async fn new<F, Fut, E, EF>(fetch_fn: F, evict_fn: E) -> Self
     where
         F: Fn(K) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = anyhow::Result<V>> + Send + Sync + 'static,
+        Fut: Future<Output = anyhow::Result<V>> + Send + 'static,
+        E: Fn(K, V) -> EF + Send + Sync + 'static,
+        EF: Future<Output = ()> + Send + 'static,
     {
         let evict_fn = Arc::new(evict_fn);
+        //let evict_fn = Arc::new(Box::new(move |k, v| {
+        //    let evict_fn = evict_fn.clone();
+        //    Box::pin(async move { evict_fn(k, v).await })
+        //}));
 
         let data = Arc::new(Mutex::new(HashMap::new()));
 
         let (evict_tx, evict_rx) = mpsc::unbounded_channel();
 
-        let evictor_join_handle = Self::evictor_join_handle(evict_rx, evict_fn.clone());
+        let evict_fn_clone = evict_fn.clone();
+        let evictor_join_handle = Self::evictor_join_handle(
+            evict_rx,
+            Arc::new(Box::new(move |k, v| {
+                let evict_fn = evict_fn_clone.clone();
+                Box::pin(evict_fn(k, v))
+            })),
+        );
 
         let access_ttl = Duration::from_secs(60);
         let pruner_join_handle =
@@ -161,9 +170,12 @@ where
             web_join_handle,
             fetch_fn: Arc::new(Box::new(move |k| {
                 let fetch_fn = fetch_fn.clone();
-                Box::pin(async move { fetch_fn(k).await })
+                Box::pin(fetch_fn(k))
             })),
-            evict_fn,
+            evict_fn: Arc::new(Box::new(move |k, v| {
+                let evict_fn = evict_fn.clone();
+                Box::pin(evict_fn(k, v))
+            })),
         }
     }
 
@@ -340,7 +352,7 @@ where
 
     pub fn evictor_join_handle(
         mut rx: mpsc::UnboundedReceiver<(K, V)>,
-        evict_fn: Arc<EvictFunc>,
+        evict_fn: Arc<EvictFunc<K, V>>,
     ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             while let Some((k, v)) = rx.recv().await {
@@ -483,13 +495,7 @@ where
     }
 }
 
-impl<
-        K,
-        V,
-        EvictFunc: Fn(K, V) -> EvictResult + Send + Sync,
-        EvictResult: Future<Output = ()> + Send + Sync,
-    > Drop for Cache<K, V, EvictFunc, EvictResult>
-{
+impl<K, V> Drop for Cache<K, V> {
     fn drop(&mut self) {
         self.evictor_join_handle.abort();
         self.pruner_join_handle.abort();
