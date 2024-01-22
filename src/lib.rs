@@ -1,3 +1,3 @@
 pub mod cache;
 
-pub use cache::{Cache, GetError, Store};
+pub use cache::{Cache, GetError};
