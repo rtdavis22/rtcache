@@ -119,6 +119,7 @@ pub struct Cache<K, V> {
     access_ttl: Duration,
     fetch_fn: Arc<FetchFunc<K, V>>,
     evict_fn: Arc<EvictFunc<K, V>>,
+    evict_fn2: Option<Arc<EvictFunc<K, V>>>,
 }
 
 impl<K, V> Cache<K, V>
@@ -176,7 +177,16 @@ where
                 let evict_fn = evict_fn.clone();
                 Box::pin(evict_fn(k, v))
             })),
+            evict_fn2: None,
         }
+    }
+
+    pub fn with_evict_fn<F, Fut>(&mut self, func: F)
+    where
+        F: Fn(K, V) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        self.evict_fn2 = Some(Arc::new(Box::new(move |k, v| Box::pin(func(k, v)))));
     }
 
     pub async fn get(&self, k: K) -> Result<Arc<V>, GetError> {
