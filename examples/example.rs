@@ -39,7 +39,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     data.insert(1, String::from("Hello"));
     let data = Arc::new(Mutex::new(data));
 
-    let mut cache = thru::Cache::new(TestStore::new(data.clone())).await;
+    let mut cache = thru::Cache::new(TestStore::new(data.clone()), Duration::from_secs(60)).await;
 
     let v = cache.get(1).await.unwrap();
 

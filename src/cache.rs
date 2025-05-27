@@ -115,7 +115,6 @@ pub struct Cache<K, V> {
     pruner_join_handle: tokio::task::JoinHandle<()>,
     web_join_handle: tokio::task::JoinHandle<io::Result<()>>,
     store: Arc<dyn Store<K, V> + Send + Sync>,
-    access_ttl: Duration,
 }
 
 impl<K, V> Cache<K, V>
@@ -123,21 +122,19 @@ where
     K: std::hash::Hash + fmt::Display + Copy + Eq + Send + Sync + 'static,
     V: Send + Sync + 'static,
 {
-    pub async fn new(store: impl Store<K, V> + Send + Sync + 'static) -> Self {
+    pub async fn new(store: impl Store<K, V> + Send + Sync + 'static, ttl: Duration) -> Self {
         let store = Arc::new(store);
 
         let data = Arc::new(Mutex::new(HashMap::new()));
 
-        let access_ttl = Duration::from_secs(60);
-        let pruner_join_handle = Self::pruner_join_handle(data.clone(), store.clone(), access_ttl);
+        let pruner_join_handle = Self::pruner_join_handle(data.clone(), store.clone(), ttl);
 
-        let web_join_handle = Self::web_join_handle(data.clone(), access_ttl);
+        let web_join_handle = Self::web_join_handle(data.clone(), ttl);
 
         Self {
             data,
             pruner_join_handle,
             store,
-            access_ttl,
             web_join_handle,
         }
     }
@@ -267,8 +264,6 @@ where
     }
 
     pub async fn evict_all_sync(&mut self) {
-        let data_clone = self.data.clone();
-
         // Make sure to hold the lock until the end of the function.
         let mut data = self.data.lock().await;
         loop {
@@ -288,25 +283,12 @@ where
 
             sleep(Duration::from_secs(1)).await;
         }
-
-        // At this point, the cache is empty and we need to wait for the evictor
-        // to finish. To do this, we construct a new evictor_join_handle
-        // and .await on the old one. This requires constructing a new channel
-        // and a new pruner_join_handle.
-
-        let new_pruner_join_handle =
-            Self::pruner_join_handle(data_clone, self.store.clone(), self.access_ttl);
-
-        // Abort the old pruner so its evict_tx is dropped,
-        // allowing the old evictor to complete.
-        self.pruner_join_handle.abort();
-        self.pruner_join_handle = new_pruner_join_handle;
     }
 
     fn pruner_join_handle(
         data: Arc<Mutex<HashMap<K, CacheEntry<V>>>>,
         store: Arc<dyn Store<K, V> + Send + Sync>,
-        access_ttl: Duration,
+        ttl: Duration,
     ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             loop {
@@ -320,7 +302,7 @@ where
                     let entry = data.entry(key);
                     if let hash_map::Entry::Occupied(mut e) = entry {
                         if let CacheEntry::Node(ref mut node) = e.get_mut() {
-                            if now.duration_since(node.unwrap().last_access_ts) < access_ttl {
+                            if now.duration_since(node.unwrap().last_access_ts) < ttl {
                                 continue;
                             }
                             match mem::replace(node, CacheNode::Dummy) {
@@ -348,7 +330,7 @@ where
 
     fn web_join_handle(
         data: Arc<Mutex<HashMap<K, CacheEntry<V>>>>,
-        access_ttl: Duration,
+        ttl: Duration,
     ) -> tokio::task::JoinHandle<io::Result<()>> {
         tokio::spawn(async move {
             let mut app = tide::with_state(data);
@@ -423,7 +405,7 @@ where
                           </body>
                         </html>
                     ",
-                        access_ttl.as_secs()
+                        ttl.as_secs()
                     );
 
                     Ok(tide::Response::builder(200)
@@ -479,7 +461,7 @@ mod tests {
     async fn it_works() {
         let (tx, mut rx) = mpsc::unbounded_channel();
 
-        let mut cache = Cache::new(TestStore { tx }).await;
+        let mut cache = Cache::new(TestStore { tx }, Duration::from_secs(60)).await;
 
         {
             let v = cache.get(10).await.unwrap();
@@ -525,7 +507,7 @@ mod tests {
 
     #[tokio::test]
     async fn multiple_waiters() {
-        let cache = Arc::new(Cache::new(StoreWithLatency).await);
+        let cache = Arc::new(Cache::new(StoreWithLatency, Duration::from_secs(60)).await);
 
         let mut tasks = JoinSet::new();
         for _ in 1..100 {
