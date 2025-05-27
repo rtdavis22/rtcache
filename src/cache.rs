@@ -17,7 +17,7 @@ use std::mem;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use tokio::sync::{broadcast, mpsc, Mutex};
+use tokio::sync::{broadcast, Mutex};
 use tokio::time::{sleep, Duration, Instant};
 
 #[async_trait]
@@ -112,8 +112,6 @@ impl error::Error for GetError {}
 
 pub struct Cache<K, V> {
     data: Arc<Mutex<HashMap<K, CacheEntry<V>>>>,
-    evict_tx: mpsc::UnboundedSender<(K, V)>,
-    evictor_join_handle: tokio::task::JoinHandle<()>,
     pruner_join_handle: tokio::task::JoinHandle<()>,
     web_join_handle: tokio::task::JoinHandle<io::Result<()>>,
     store: Arc<dyn Store<K, V> + Send + Sync>,
@@ -130,20 +128,13 @@ where
 
         let data = Arc::new(Mutex::new(HashMap::new()));
 
-        let (evict_tx, evict_rx) = mpsc::unbounded_channel();
-
-        let evictor_join_handle = Self::evictor_join_handle(evict_rx, store.clone());
-
         let access_ttl = Duration::from_secs(60);
-        let pruner_join_handle =
-            Self::pruner_join_handle(data.clone(), evict_tx.clone(), access_ttl);
+        let pruner_join_handle = Self::pruner_join_handle(data.clone(), store.clone(), access_ttl);
 
         let web_join_handle = Self::web_join_handle(data.clone(), access_ttl);
 
         Self {
             data,
-            evict_tx,
-            evictor_join_handle,
             pruner_join_handle,
             store,
             access_ttl,
@@ -241,6 +232,7 @@ where
         k: K,
         lock: &mut tokio::sync::MutexGuard<'_, HashMap<K, CacheEntry<V>>>,
     ) -> bool {
+        let store = self.store.clone();
         match lock.entry(k) {
             hash_map::Entry::Vacant(_) => true,
             hash_map::Entry::Occupied(mut e) => match e.get_mut() {
@@ -252,7 +244,7 @@ where
                     CacheNode::Real(real_node) => match RealCacheNode::try_unwrap(real_node) {
                         Ok(v) => {
                             e.remove();
-                            self.evict_tx.send((k, v)).unwrap();
+                            store.update(k, v).await;
                             true
                         }
                         Err(real_node) => {
@@ -302,39 +294,18 @@ where
         // and .await on the old one. This requires constructing a new channel
         // and a new pruner_join_handle.
 
-        let (new_evict_tx, new_evict_rx) = mpsc::unbounded_channel();
         let new_pruner_join_handle =
-            Self::pruner_join_handle(data_clone, new_evict_tx.clone(), self.access_ttl);
-
-        drop(std::mem::replace(&mut self.evict_tx, new_evict_tx));
-
-        let new_evictor_join_handle = Self::evictor_join_handle(new_evict_rx, self.store.clone());
+            Self::pruner_join_handle(data_clone, self.store.clone(), self.access_ttl);
 
         // Abort the old pruner so its evict_tx is dropped,
         // allowing the old evictor to complete.
         self.pruner_join_handle.abort();
         self.pruner_join_handle = new_pruner_join_handle;
-
-        // Replace the evictor and wait for the old evictor to evict everything.
-        std::mem::replace(&mut self.evictor_join_handle, new_evictor_join_handle)
-            .await
-            .unwrap();
-    }
-
-    pub fn evictor_join_handle(
-        mut rx: mpsc::UnboundedReceiver<(K, V)>,
-        store: Arc<dyn Store<K, V> + Send + Sync>,
-    ) -> tokio::task::JoinHandle<()> {
-        tokio::spawn(async move {
-            while let Some((k, v)) = rx.recv().await {
-                store.update(k, v).await;
-            }
-        })
     }
 
     fn pruner_join_handle(
         data: Arc<Mutex<HashMap<K, CacheEntry<V>>>>,
-        tx: mpsc::UnboundedSender<(K, V)>,
+        store: Arc<dyn Store<K, V> + Send + Sync>,
         access_ttl: Duration,
     ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
@@ -357,7 +328,7 @@ where
                                     match RealCacheNode::try_unwrap(real_node) {
                                         Ok(v) => {
                                             e.remove();
-                                            tx.send((key, v)).unwrap()
+                                            store.update(key, v).await;
                                         }
                                         Err(real_node) => {
                                             *node = CacheNode::Real(real_node);
@@ -468,7 +439,6 @@ where
 
 impl<K, V> Drop for Cache<K, V> {
     fn drop(&mut self) {
-        self.evictor_join_handle.abort();
         self.pruner_join_handle.abort();
         // TODO: Use axum which supports graceful shutdown.
         self.web_join_handle.abort();
