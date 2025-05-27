@@ -1,4 +1,6 @@
+use std::collections::HashMap;
 use std::error::Error;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use tokio::sync::Mutex;
@@ -6,25 +8,40 @@ use tokio::time::{sleep, Duration};
 
 use thru::Store;
 
-struct TestStore;
+struct TestStore {
+    data: Arc<Mutex<HashMap<i32, String>>>,
+}
+
+impl TestStore {
+    fn new(data: Arc<Mutex<HashMap<i32, String>>>) -> Self {
+        Self { data }
+    }
+}
 
 #[async_trait]
 impl Store<i32, Mutex<String>> for TestStore {
     async fn fetch(&self, key: &i32) -> anyhow::Result<Mutex<String>> {
-        println!("[Fetch] key: {}", key);
-        Ok(Mutex::new(String::from("Hello")))
+        if let Some(value) = self.data.lock().await.get(key) {
+            Ok(Mutex::new(value.clone()))
+        } else {
+            Err(anyhow::anyhow!("Key not found"))
+        }
     }
 
     async fn update(&self, key: i32, value: Mutex<String>) {
-        println!("[Update] key: {}, value: {}", key, value.lock().await);
+        self.data.lock().await.insert(key, value.into_inner());
     }
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
-    let mut cache = thru::Cache::new(TestStore).await;
+    let mut data = HashMap::new();
+    data.insert(1, String::from("Hello"));
+    let data = Arc::new(Mutex::new(data));
 
-    let v = cache.get(12).await.unwrap();
+    let mut cache = thru::Cache::new(TestStore::new(data.clone())).await;
+
+    let v = cache.get(1).await.unwrap();
 
     tokio::spawn(async move {
         sleep(Duration::from_secs(1)).await;
@@ -33,6 +50,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
     });
 
     cache.evict_all_sync().await;
+
+    println!("{}", data.lock().await.get(&1).unwrap());
 
     Ok(())
 }
