@@ -1,14 +1,3 @@
-// TODO:
-// X Replace Mutex<String> with T
-// X Support Fetchers and Stores
-// X Add examples and unit tests
-// 4. Docs
-// 5. Support other common functionality.
-// 6. Clean up join handle stuff.
-// X Support ttl/access ttl (see moka)
-// 8. Store total time in cache (and display in web UI)
-// 9. Config (enabling web ui, access ttl)
-
 use std::collections::{hash_map, HashMap};
 use std::error;
 use std::fmt;
@@ -124,11 +113,8 @@ where
 {
     pub async fn new(store: impl Store<K, V> + Send + Sync + 'static, ttl: Duration) -> Self {
         let store = Arc::new(store);
-
         let data = Arc::new(Mutex::new(HashMap::new()));
-
         let pruner_join_handle = Self::pruner_join_handle(data.clone(), store.clone(), ttl);
-
         let web_join_handle = Self::web_join_handle(data.clone(), ttl);
 
         Self {
@@ -222,9 +208,39 @@ where
         self.data.lock().await.remove(&k);
     }
 
+    // Evicts the given key from the cache if the value's ref count is 1.
+    pub async fn try_evict(&self, k: K) -> bool {
+        let data = self.data.clone();
+        let mut lock = data.lock().await;
+        self.try_evict_with_lock(k, &mut lock).await
+    }
+
+    // Evicts all keys from the cache, waiting if necessary until all ref counts are 1.
+    pub async fn evict_all_sync(&mut self) {
+        // Make sure to hold the lock until the end of the function.
+        let mut data = self.data.lock().await;
+        loop {
+            let keys: Vec<_> = data.keys().copied().collect();
+            if keys.is_empty() {
+                break;
+            }
+
+            let mut all_done = true;
+            for key in keys {
+                all_done = all_done && self.try_evict_with_lock(key, &mut data).await;
+            }
+
+            if all_done {
+                break;
+            }
+
+            sleep(Duration::from_secs(1)).await;
+        }
+    }
+
     // Returns false if the key can't be evicted because the reference
     // count of the Arc is not one.
-    async fn try_evict_without_lock(
+    async fn try_evict_with_lock(
         &self,
         k: K,
         lock: &mut tokio::sync::MutexGuard<'_, HashMap<K, CacheEntry<V>>>,
@@ -254,34 +270,6 @@ where
                     CacheNode::Dummy => false,
                 },
             },
-        }
-    }
-
-    pub async fn try_evict(&self, k: K) -> bool {
-        let data = self.data.clone();
-        let mut lock = data.lock().await;
-        self.try_evict_without_lock(k, &mut lock).await
-    }
-
-    pub async fn evict_all_sync(&mut self) {
-        // Make sure to hold the lock until the end of the function.
-        let mut data = self.data.lock().await;
-        loop {
-            let keys: Vec<_> = data.keys().copied().collect();
-            if keys.is_empty() {
-                break;
-            }
-
-            let mut all_done = true;
-            for key in keys {
-                all_done = all_done && self.try_evict_without_lock(key, &mut data).await;
-            }
-
-            if all_done {
-                break;
-            }
-
-            sleep(Duration::from_secs(1)).await;
         }
     }
 
@@ -328,6 +316,8 @@ where
         })
     }
 
+    // A basic web UI that shows the contents of the cache.
+    // TODO: Only enable this if requested.
     fn web_join_handle(
         data: Arc<Mutex<HashMap<K, CacheEntry<V>>>>,
         ttl: Duration,
