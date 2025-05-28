@@ -1,7 +1,6 @@
 use std::collections::{hash_map, HashMap};
 use std::error;
 use std::fmt;
-use std::io;
 use std::mem;
 use std::sync::Arc;
 
@@ -18,6 +17,7 @@ pub trait Store<K, V> {
 #[derive(Debug)]
 struct RealCacheNode<V> {
     value: Arc<V>,
+    #[allow(dead_code)]
     first_access_ts: Instant,
     last_access_ts: Instant,
 }
@@ -102,7 +102,6 @@ impl error::Error for GetError {}
 pub struct Cache<K, V> {
     data: Arc<Mutex<HashMap<K, CacheEntry<V>>>>,
     pruner_join_handle: tokio::task::JoinHandle<()>,
-    web_join_handle: tokio::task::JoinHandle<io::Result<()>>,
     store: Arc<dyn Store<K, V> + Send + Sync>,
 }
 
@@ -115,13 +114,11 @@ where
         let store = Arc::new(store);
         let data = Arc::new(Mutex::new(HashMap::new()));
         let pruner_join_handle = Self::pruner_join_handle(data.clone(), store.clone(), ttl);
-        let web_join_handle = Self::web_join_handle(data.clone(), ttl);
 
         Self {
             data,
             pruner_join_handle,
             store,
-            web_join_handle,
         }
     }
 
@@ -315,105 +312,11 @@ where
             }
         })
     }
-
-    // A basic web UI that shows the contents of the cache.
-    // TODO: Only enable this if requested.
-    fn web_join_handle(
-        data: Arc<Mutex<HashMap<K, CacheEntry<V>>>>,
-        ttl: Duration,
-    ) -> tokio::task::JoinHandle<io::Result<()>> {
-        tokio::spawn(async move {
-            let mut app = tide::with_state(data);
-            app.at("/").get(
-                move |req: tide::Request<Arc<Mutex<HashMap<K, CacheEntry<V>>>>>| async move {
-                    let mut table = String::from("<table>");
-                    table.push_str(
-                        "
-                        <tr>
-                          <th>Key</th>
-                          <th>Time since last access</th>
-                          <th>Time in cache</th>
-                          <th>Strong count</th>
-                        </tr>",
-                    );
-                    let data = req.state().lock().await;
-                    let now = Instant::now();
-                    for (k, entry) in &*data {
-                        table.push_str("<tr>");
-                        table += &*format!("<td>{}</td>", k);
-                        table += "<td>";
-                        table += &match entry {
-                            CacheEntry::Fetching(_) => String::from("Fetching..."),
-                            CacheEntry::Node(node) => match node {
-                                CacheNode::Real(real_node) => {
-                                    now.duration_since(real_node.last_access_ts)
-                                        .as_secs()
-                                        .to_string()
-                                        + " secs."
-                                }
-                                CacheNode::Dummy => String::from("<Dummy>"),
-                            },
-                            CacheEntry::FetchFailed(_) => String::from("<Fetch error>"),
-                        };
-                        table += "</td>";
-                        if let CacheEntry::Node(CacheNode::Real(real_node)) = entry {
-                            let time_in_cache =
-                                now.duration_since(real_node.first_access_ts).as_secs();
-                            table += &format!("<td>{time_in_cache} secs.</td>");
-                        } else {
-                            table += "<td></td>";
-                        }
-                        if let CacheEntry::Node(CacheNode::Real(real_node)) = entry {
-                            let strong_count = Arc::strong_count(&real_node.value);
-                            table += &format!("<td>{strong_count}</td>");
-                        } else {
-                            table += "<td></td>";
-                        }
-                        table.push_str("</tr>");
-                    }
-                    table.push_str("</table>");
-
-                    let response = format!(
-                        "
-                        <html>
-                          <head>
-                            <style>
-                              table {{
-                                width: 100%;
-                                border-collapse: collapse;
-                              }}
-                              td, th {{
-                                border: 1px solid black;
-                                text-align: left;
-                                padding: 8px;
-                              }}
-                            </style>
-                          </head>
-                          <body>
-                            <p>Access TTL: {} secs.</p>
-                            {table}
-                          </body>
-                        </html>
-                    ",
-                        ttl.as_secs()
-                    );
-
-                    Ok(tide::Response::builder(200)
-                        .body(response)
-                        .content_type(tide::http::mime::HTML)
-                        .build())
-                },
-            );
-            app.listen("127.0.0.1:8030").await
-        })
-    }
 }
 
 impl<K, V> Drop for Cache<K, V> {
     fn drop(&mut self) {
         self.pruner_join_handle.abort();
-        // TODO: Use axum which supports graceful shutdown.
-        self.web_join_handle.abort();
     }
 }
 
