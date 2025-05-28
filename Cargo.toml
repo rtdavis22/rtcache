@@ -2,6 +2,11 @@
 name = "thru"
 version = "0.1.0"
 edition = "2021"
+repository = "https://github.com/rtdavis22/rtcache"
+license = "Apache-2.0 OR MIT"
+description = "A read-through/write-back cache"
+keywords = ["cache"]
+categories = ["caching"]
 
 [dependencies]
 anyhow = "1.0"
