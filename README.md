@@ -42,6 +42,21 @@ let data = Arc::new(Mutex::new(data));
 let mut cache = Cache::new(TestStore::new(data.clone()), Duration::from_secs(60)).await;
 ```
 
+Use `Cache::get` to access values in the cache.
+
+```rust
+// The store's `fetch` function will be used if this key isn't in the cache already.
+let value = cache.get(1).await.unwrap();
+```
+
+Values may be modified using [interior mutability](https://doc.rust-lang.org/book/ch15-05-interior-mutability.html):
+
+```rust
+*value.lock().await = String::from("World");
+```
+
+The `Store`'s `update` function is called when a key/value pair is evicted from the cache. This is a good place to update the cache's backing store in case there were any modifications to the value.
+
 See examples/examples.rb for more.
 
-The cache internally stores values in `Arc`s and `Cache::get` returns a cloned pointer. If an `Arc<V>` has a reference count more than one, the `Arc` is in use outside of the cache and the key/value pair will not be evicted from the cache.
+**Important note: The cache internally stores values in `Arc`s and `Cache::get` returns a cloned pointer. If an `Arc<V>` has a reference count more than one, the `Arc` is in use outside of the cache and the key/value pair will not be evicted from the cache.**
