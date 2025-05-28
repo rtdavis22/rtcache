@@ -1,98 +1,47 @@
 # rtcache
 
-A high-performance, thread-safe caching library for Rust with built-in TTL support and web UI monitoring.
+A read-through/write-back caching library.
 
-## Features
-
-- 🚀 **High Performance**: Built on Tokio for async/await support
-- 🔒 **Thread-Safe**: Fully concurrent and safe for multi-threaded environments
-- ⏱️ **TTL Support**: Automatic cache entry expiration
-- 📊 **Web UI**: Built-in monitoring interface
-- 🔄 **Automatic Pruning**: Background task for cache maintenance
-- 🎯 **Type-Safe**: Generic implementation supporting any key-value types
-- 🔌 **Extensible**: Customizable storage backends via the `Store` trait
-
-## Installation
-
-Add this to your `Cargo.toml`:
-
-```toml
-[dependencies]
-rtcache = "0.1.0"
-```
-
-## Quick Start
+To create a cache, first define a store and implement the `Store` trait:
 
 ```rust
-use std::time::Duration;
-use rtcache::{Cache, Store};
-use anyhow::Result;
+struct TestStore {
+    data: Arc<Mutex<HashMap<i32, String>>>,
+}
 
-// Implement your storage backend
-struct MyStore;
-
-#[async_trait::async_trait]
-impl Store<String, String> for MyStore {
-    async fn fetch(&self, key: &String) -> Result<String> {
-        // Implement your fetch logic
-        Ok(format!("Value for {}", key))
-    }
-
-    async fn update(&self, key: String, value: String) {
-        // Implement your update logic
+impl TestStore {
+    fn new(data: Arc<Mutex<HashMap<i32, String>>>) -> Self {
+        Self { data }
     }
 }
 
-#[tokio::main]
-async fn main() {
-    // Create a new cache with 1 hour TTL
-    let cache = Cache::new(MyStore, Duration::from_secs(3600)).await;
+#[async_trait]
+impl Store<i32, Mutex<String>> for TestStore {
+    async fn fetch(&self, key: &i32) -> anyhow::Result<Mutex<String>> {
+        if let Some(value) = self.data.lock().await.get(key) {
+            Ok(Mutex::new(value.clone()))
+        } else {
+            Err(anyhow::anyhow!("Key not found"))
+        }
+    }
 
-    // Get a value (will fetch if not in cache)
-    let value = cache.get("my_key".to_string()).await.unwrap();
-    println!("Value: {}", value);
+    // Optional
+    async fn update(&self, key: i32, value: Mutex<String>) {
+        self.data.lock().await.insert(key, value.into_inner());
+    }
 }
 ```
 
-## Key Concepts
+Then, initialize the cache:
 
-### Cache Entry States
+```rust
+let mut data = HashMap::new();
+data.insert(1, String::from("Hello"));
+let data = Arc::new(Mutex::new(data));
 
-The cache maintains entries in one of three states:
+let mut cache = Cache::new(TestStore::new(data.clone()), Duration::from_secs(60)).await;
+```
 
-- `Fetching`: Entry is currently being fetched
-- `FetchFailed`: Previous fetch attempt failed
-- `Node`: Valid cache entry with value
+See examples/examples.rb for more.
 
-### Features in Detail
-
-1. **Automatic TTL**: Cache entries are automatically removed after their TTL expires
-2. **Concurrent Access**: Multiple threads can safely access the cache simultaneously
-3. **Web UI**: Monitor cache statistics and performance through a built-in web interface
-4. **Background Pruning**: Automatic cleanup of expired entries
-5. **Error Handling**: Robust error handling with `anyhow` integration
-
-## API Reference
-
-### Main Types
-
-- `Cache<K, V>`: The main cache type
-- `Store<K, V>`: Trait for implementing custom storage backends
-- `GetError`: Error type for cache retrieval failures
-
-### Key Methods
-
-- `Cache::new(store, ttl)`: Create a new cache instance
-- `Cache::get(key)`: Retrieve a value (fetches if not cached)
-- `Cache::insert(key, value)`: Manually insert a value
-- `Cache::remove(key)`: Remove a value from the cache
-- `Cache::try_evict(key)`: Attempt to evict a specific entry
-- `Cache::evict_all_sync()`: Remove all entries from the cache
-
-## Contributing
-
-Contributions are welcome! Please feel free to submit a Pull Request.
-
-## License
-
-This project is licensed under the MIT License - see the LICENSE file for details.
+The cache internally stores values in `Arc`s and `Cache::get` returns a cloned pointer. If an `Arc<V>` has a reference count more than one, the `Arc` is in use outside of the cache and the key/value pair will not be evicted from the cache.
