@@ -57,6 +57,6 @@ Values may be modified using [interior mutability](https://doc.rust-lang.org/boo
 
 The `Store`'s `update` function is called when a key/value pair is evicted from the cache. This is a good place to update the cache's backing store in case there were any modifications to the value.
 
-See examples/examples.rb for more.
+See examples/examples.rs for more.
 
 **Important note: The cache internally stores values in `Arc`s and `Cache::get` returns a cloned pointer. If an `Arc<V>` has a reference count more than one, the `Arc` is in use outside of the cache and the key/value pair will not be evicted from the cache.**

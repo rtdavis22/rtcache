@@ -1,6 +1,6 @@
 [package]
 name = "rtcache"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2021"
 repository = "https://github.com/rtdavis22/rtcache"
 license = "Apache-2.0 OR MIT"
