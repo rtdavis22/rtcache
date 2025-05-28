@@ -1,4 +1,4 @@
-# Thru
+# rtcache
 
 A high-performance, thread-safe caching library for Rust with built-in TTL support and web UI monitoring.
 
@@ -18,14 +18,14 @@ Add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-thru = "0.1.0"
+rtcache = "0.1.0"
 ```
 
 ## Quick Start
 
 ```rust
 use std::time::Duration;
-use thru::{Cache, Store};
+use rtcache::{Cache, Store};
 use anyhow::Result;
 
 // Implement your storage backend

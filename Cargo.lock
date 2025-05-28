@@ -1425,6 +1425,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "56770675ebc04927ded3e60633437841581c285dc6236109ea25fbf3beb7b59e"
 
 [[package]]
+name = "rtcache"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "tide",
+ "tokio",
+]
+
+[[package]]
 name = "rustc-demangle"
 version = "0.1.24"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1824,16 +1834,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.101",
-]
-
-[[package]]
-name = "thru"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "tide",
- "tokio",
 ]
 
 [[package]]

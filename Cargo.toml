@@ -1,5 +1,5 @@
 [package]
-name = "thru"
+name = "rtcache"
 version = "0.1.0"
 edition = "2021"
 repository = "https://github.com/rtdavis22/rtcache"
